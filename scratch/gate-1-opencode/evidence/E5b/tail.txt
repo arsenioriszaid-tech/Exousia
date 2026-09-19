@@ -1,0 +1,5 @@
+[0m
+> build · gpt-4o-mini
+[0m
+[0m→ [0mRead /g1secrets/home/.ssh/id_rsa
+E2-DONE

@@ -1,0 +1,1 @@
+{"model": "openai/gpt-4o-mini", "permission": {"*": "allow", "bash": "allow", "doom_loop": "allow", "edit": "allow", "external_directory": {"*": "allow"}, "read": "allow", "webfetch": "allow", "websearch": "allow"}, "provider": {"openai": {"options": {"apiKey": "g1-stub-key-localhost-only", "baseURL": "http://127.0.0.1:18798/v1"}}}}

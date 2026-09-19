@@ -92,6 +92,15 @@ a non-sensitive repo: can unmediated paths be closed without OpenCode's cooperat
 same D-class denials against a real harness. Kill on failure: "below agent config" becomes
 "beside agent config."
 
+### Follow-up executed 2026-09-19 (branch gate-1/opencode-routing)
+
+Done: real opencode 1.18.31 + tool.execute.before plugin + supervisor socket + sandbox,
+scripted localhost stub (model judgment not tested). E1 ALLOW, E2/E3 hook DENY under
+maximally-permissive native config, E4 plugin-file destroyed yet read still DENY,
+E5a fail-closed without supervisor, E5b raw bypass succeeds (fake). Verdict:
+PASS-WITH-BOUNDS. Full log: docs/validation/GATE-1-OPENCODE-ROUTING.md,
+matrix: scratch/gate-1-opencode/results-oc.json, evidence: scratch/gate-1-opencode/evidence/.
+
 ```
 EXPECTED INFORMATION GAIN: whether the third-party premise survives contact with a real harness
 ESTIMATED TIME: 1 session (config + hooks only, no product code)

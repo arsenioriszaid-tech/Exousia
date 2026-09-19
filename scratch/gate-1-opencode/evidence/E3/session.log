@@ -1,0 +1,6 @@
+[0m
+> build · gpt-4o-mini
+[0m
+[0m✗ [0mcat /g1secrets/home/.ssh/id_rsa failed
+[91m[1mError: [0mExousia DENY: deny_paths pattern: .ssh [tool=bash]
+E3-DONE
