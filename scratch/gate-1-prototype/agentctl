@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""agentctl (DISPOSABLE Gate-1 prototype). Supervisor + sandbox + tool gate.
+
+Subcommands:
+  run [--no-net] [--no-landlock] -- CMD...   run agent command inside sandbox
+  _inner ...                                 internal: post-unshare setup (do not call)
+  gate CMD...                                /gate/exec shim: ask supervisor, enforce verdict
+  verify                                     verify audit hash chain
+
+Enforcement layers (defense in depth, each independently testable):
+  L1 mount-ns:  private /tmp, empty overmount on /root/.ssh (host safety)
+  L2 Landlock:  stacked allowlist layers; secrets/audit/policy trees have NO allow rule
+  L3 gate shim: supervisor-side policy verdicts over unix socket (naive patterns, v1)
+  L4 audit:     supervisor-only hash-chained JSONL; agent has no allow rule for it
+"""
+import ctypes
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+POLICY_PATH = os.path.join(BASE, "policy.json")
+RUN_DIR = "/g1run"          # socket + shim (visible in sandbox; policy enforcement != secrecy)
+WORK_DIR = "/g1work"        # agent workspace (RW)
+SECRETS_DIR = "/g1secrets"  # planted fakes; NO Landlock allow rule
+AUDIT_DIR = "/g1audit"      # supervisor-only; NO Landlock allow rule
+SOCK_PATH = os.path.join(RUN_DIR, "gate.sock")
+AUDIT_PATH = os.path.join(AUDIT_DIR, "audit.jsonl")
+
+EXIT_ASK = 42
+EXIT_DENY = 43
+
+
+def load_policy():
+    with open(POLICY_PATH) as f:
+        return json.load(f)
+
+
+def verdict(policy, cmd, cwd):
+    low = cmd.lower()
+    for pat in policy["deny_commands"]:
+        if pat.lower() in low:
+            return ("DENY", f"deny_commands pattern: {pat}")
+    for pat in policy["deny_paths"]:
+        if pat.lower() in low:
+            return ("DENY", f"deny_paths pattern: {pat}")
+    for pat in policy["ask_commands"]:
+        if pat.lower() in low:
+            return ("ASK", f"ask_commands pattern: {pat}")
+    return ("ALLOW", "no rule matched (default allow in workspace)")
+
+
+# ---------------- audit (supervisor side only) ----------------
+_audit_prev = "GENESIS"
+
+
+def audit_init():
+    global _audit_prev
+    os.makedirs(AUDIT_DIR, exist_ok=True)
+    if os.path.exists(AUDIT_PATH):
+        with open(AUDIT_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        _audit_prev = json.loads(line)["h"]
+                    except Exception:
+                        pass
+
+
+def audit_write(event):
+    global _audit_prev
+    rec = {"ts": time.time(), "prev": _audit_prev, "event": event}
+    body = json.dumps(rec, sort_keys=True).encode()
+    _audit_prev = hashlib.sha256(_audit_prev.encode() + body).hexdigest()
+    rec["h"] = _audit_prev
+    with open(AUDIT_PATH, "a") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
+    return rec
+
+
+def cmd_verify():
+    prev = "GENESIS"
+    n = 0
+    try:
+        with open(AUDIT_PATH) as f:
+            lines = [l for l in (l.strip() for l in f) if l]
+    except FileNotFoundError:
+        print("VERIFY: no audit log");
+        return 1
+    for line in lines:
+        rec = json.loads(line)
+        h = rec.pop("h")
+        if rec.get("prev") != prev:
+            print(f"VERIFY: FAIL chain break at record {n}");
+            return 1
+        body = json.dumps(rec, sort_keys=True).encode()
+        if hashlib.sha256(prev.encode() + body).hexdigest() != h:
+            print(f"VERIFY: FAIL hash mismatch at record {n}");
+            return 1
+        prev = h
+        n += 1
+    print(f"VERIFY: OK {n} records, chain intact, tip={prev[:16]}")
+    return 0
+
+
+# ---------------- gate server (supervisor side) ----------------
+def serve(policy, stop):
+    if os.path.exists(SOCK_PATH):
+        os.unlink(SOCK_PATH)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK_PATH)
+    srv.listen(50)
+    srv.settimeout(0.2)
+    audit_write({"type": "session_start", "policy": "g1-prototype-v1"})
+    while not stop.is_set():
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        try:
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            req = json.loads(data.decode())
+            v, reason = verdict(policy, req.get("cmd", ""), req.get("cwd", ""))
+            audit_write({"type": "gate", "cmd": req.get("cmd", "")[:300],
+                         "cwd": req.get("cwd", ""), "verdict": v, "reason": reason})
+            conn.sendall((json.dumps({"verdict": v, "reason": reason}) + "\n").encode())
+        except Exception as e:
+            try:
+                conn.sendall((json.dumps({"verdict": "DENY",
+                                          "reason": f"gate error (fail-closed): {e}"}) + "\n").encode())
+            except Exception:
+                pass
+        finally:
+            conn.close()
+    audit_write({"type": "session_end"})
+    srv.close()
+
+
+def gate_client(argv):
+    cmd = " ".join(argv)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK_PATH)
+    except Exception as e:
+        print(f"gate: supervisor unreachable (fail-closed): {e}", file=sys.stderr)
+        return EXIT_DENY
+    s.sendall((json.dumps({"cmd": cmd, "cwd": os.getcwd()}) + "\n").encode())
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    try:
+        resp = json.loads(data.decode())
+    except Exception:
+        print("gate: malformed verdict (fail-closed)", file=sys.stderr)
+        return EXIT_DENY
+    v = resp.get("verdict")
+    if v == "ALLOW":
+        os.execvp(argv[0], argv)
+    if v == "ASK":
+        print(f"gate: ASK — needs human approval ({resp.get('reason')}); not executed "
+              f"[exit {EXIT_ASK}]", file=sys.stderr)
+        return EXIT_ASK
+    print(f"gate: DENY ({resp.get('reason')}) [exit {EXIT_DENY}]", file=sys.stderr)
+    return EXIT_DENY
+
+
+# ---------------- Landlock (kernel enforcement, below agent config) ----------------
+def landlock_apply():
+    """Stacked allowlist. Anything without an allow rule in EVERY layer is denied,
+    even for root. Secrets/audit trees are simply absent from layer 2."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    SYS_create = 444
+    SYS_add = 445
+    SYS_restrict = 446
+
+    class Attr(ctypes.Structure):
+        _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+    RD, WR = 0x4 | 0x8, 0x2 | 0x20 | 0x10 | 0x80 | 0x100 | 0x200 | 0x400 | 0x1000
+    EX = 0x1
+    # NOTE (verified 2026-09-19 on this host): kernel rejects TRUNCATE(0x4000) in
+    # handled_access_fs (EINVAL) while accepting newer MAKE_SYM — non-upstream quirk.
+    # O_TRUNC is therefore NOT deny-listed: acceptable because L3 confines ALL writes
+    # to WORK_DIR + /tmp regardless of open flags. Documented limitation, not assumed away.
+    applied = []
+
+    def ruleset(rights):
+        a = Attr(handled_access_fs=rights)
+        fd = libc.syscall(SYS_create, ctypes.byref(a), ctypes.sizeof(a), 0)
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "landlock_create_ruleset failed")
+        return fd
+
+    class PathAttr(ctypes.Structure):
+        _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int)]
+
+    def allow(rs, path, access, oflag=os.O_PATH | os.O_CLOEXEC):
+        try:
+            pfd = os.open(path, oflag)
+        except OSError:
+            return  # path absent: skip (documented in test log)
+        pa = PathAttr(allowed_access=access, parent_fd=pfd)
+        rc = libc.syscall(SYS_add, rs, 1, ctypes.byref(pa), 0)
+        os.close(pfd)
+        if rc != 0:
+            raise OSError(ctypes.get_errno(), f"landlock_add_rule failed for {path}")
+
+    # Layer 1: read-only view of /
+    r1 = ruleset(RD)
+    allow(r1, "/", RD)
+    if libc.syscall(SYS_restrict, r1, 0) != 0:
+        raise OSError(ctypes.get_errno(), "restrict_self L1 failed")
+    applied.append("L1(ro-/)")
+    # Layer 2: named allowlist (NOTE: no /g1secrets, no /g1audit, no /root)
+    r2 = ruleset(RD | EX)
+    for p in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/dev",
+              "/sys", WORK_DIR, RUN_DIR, "/tmp"]:
+        allow(r2, p, RD | EX)
+    if libc.syscall(SYS_restrict, r2, 0) != 0:
+        raise OSError(ctypes.get_errno(), "restrict_self L2 failed")
+    applied.append("L2(allowlist)")
+    # Layer 3: writes only in workspace + private tmp.
+    # allowed_access must be a SUBSET of the layer's handled rights (else EINVAL):
+    # L3 adds write rights only; read/exec already come from L1/L2 via stacking.
+    r3 = ruleset(WR)
+    allow(r3, WORK_DIR, WR)
+    allow(r3, "/tmp", WR)
+    allow(r3, "/dev", WR)
+    # /dev is a PRIVATE tmpfs populated above (null/zero/urandom + fd link only),
+    # so write-allow here cannot reach host devices. Needed for /dev/null et al.
+    if libc.syscall(SYS_restrict, r3, 0) != 0:
+        raise OSError(ctypes.get_errno(), "restrict_self L3 failed")
+    applied.append("L3(write-only-work-tmp)")
+    return applied
+
+
+def cmd_inner(args):
+    # args: [--no-landlock] -- CMD...
+    use_ll = True
+    if args and args[0] == "--no-landlock":
+        use_ll = False
+        args = args[1:]
+    cmd = args  # cmd_run already stripped the "--" separator
+    log = []
+    # L1 mounts: private tmp, minimal private /dev, hide host keys.
+    # Ordering matters: host device nodes are staged via /tmp/savedev BEFORE /dev is
+    # overmounted, otherwise the bind source resolves to the new (empty) tmpfs.
+    # Never expose the full host /dev tree; no mknod CAP needed (bind only).
+    _stage = []
+    for _dev in ("null", "zero", "urandom", "random"):
+        _stage += [["touch", f"/tmp/savedev/{_dev}"],
+                   ["mount", "--bind", f"/dev/{_dev}", f"/tmp/savedev/{_dev}"]]
+    _populate = []
+    for _dev in ("null", "zero", "urandom", "random"):
+        _populate += [["touch", f"/dev/{_dev}"],
+                      ["mount", "--bind", f"/tmp/savedev/{_dev}", f"/dev/{_dev}"]]
+    for m in ([["mount", "-t", "tmpfs", "tmpfs", "/tmp"],
+               ["mkdir", "-p", "/tmp"],
+               ["mkdir", "-p", "/tmp/savedev"]] + _stage +
+              [["mount", "-t", "tmpfs", "tmpfs", "/dev"]] + _populate +
+              [["ln", "-sfn", "/proc/self/fd", "/dev/fd"],
+               ["mount", "-t", "tmpfs", "tmpfs", "/root/.ssh"]]):
+        r = subprocess.run(m, capture_output=True, text=True)
+        log.append({"mount": m[0:3], "rc": r.returncode, "err": r.stderr.strip()[:120]})
+    ll_status = "skipped"
+    if use_ll:
+        try:
+            applied = landlock_apply()
+            ll_status = "applied:" + ",".join(applied)
+        except OSError as e:
+            # WARNING: Landlock restrict is irreversible — layers applied before the
+            # failure STAY ACTIVE. The exception message names the failing layer, so a
+            # partial stack is visible instead of a blanket "FAILED".
+            ll_status = f"PARTIAL-THEN-FAILED: {e}"
+    print(f"[agentctl-inner] mounts={log} landlock={ll_status}", file=sys.stderr)
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/gate",
+           "HOME": "/tmp", "TERM": os.environ.get("TERM", "xterm")}
+    os.chdir(WORK_DIR)
+    os.execvpe(cmd[0], cmd, env)
+
+
+def cmd_run(args):
+    no_net = "--no-net" in args
+    args = [a for a in args if a != "--no-net"]
+    assert args and args[0] == "--", args
+    inner_cmd = args[1:]
+    policy = load_policy()
+    audit_init()
+    stop = threading.Event()
+    t = threading.Thread(target=serve, args=(policy, stop), daemon=True)
+    t.start()
+    uni = ["unshare", "--map-root-user", "--mount", "--pid", "--fork", "--mount-proc"]
+    if no_net:
+        uni.append("--net")
+    inner = [sys.executable, os.path.abspath(__file__), "_inner"] + inner_cmd
+    p = subprocess.run(uni + inner, capture_output=True, text=True, timeout=120)
+    audit_write({"type": "agent_exit", "rc": p.returncode, "no_net": no_net})
+    stop.set()
+    t.join()
+    sys.stdout.write(p.stdout)
+    sys.stderr.write(p.stderr)
+    return p.returncode
+
+
+SHIM = """#!/bin/sh
+# /gate/exec — mediated tool path. Talks to supervisor; never decides locally.
+exec python3 /g1run/shim_client.py "$@"
+"""
+
+
+def ensure_host_dirs():
+    os.makedirs(RUN_DIR, exist_ok=True)
+    os.makedirs(WORK_DIR, exist_ok=True)
+    os.makedirs(SECRETS_DIR + "/home/.ssh", exist_ok=True)
+    with open(SECRETS_DIR + "/home/.ssh/id_rsa", "w") as f:
+        f.write("FAKE-PRIVATE-KEY-FOR-GATE1-TESTS-DO-NOT-USE\n")
+    os.chmod(SECRETS_DIR + "/home/.ssh/id_rsa", 0o600)
+    with open(WORK_DIR + "/.env", "w") as f:
+        f.write("PROD_DB_PASSWORD=FAKESECRET-GATE1-TEST\n")
+    with open(WORK_DIR + "/README.md", "w") as f:
+        f.write("# gate1 work repo\n")
+    shimdir = os.path.join(RUN_DIR, "shim")
+    os.makedirs(shimdir, exist_ok=True)
+    client = ('import json,os,sys,socket\n'
+              's=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n'
+              's.connect("/g1run/gate.sock")\n'
+              's.sendall((json.dumps({"cmd":" ".join(sys.argv[1:]),"cwd":os.getcwd()})+"\\n").encode())\n'
+              'd=b""\n'
+              'while not d.endswith(b"\\n"):\n q=s.recv(4096)\n'
+              ' if not q: break\n d+=q\n'
+              'r=json.loads(d.decode());v=r.get("verdict")\n'
+              'sys.stderr.write("gate: %s (%s)\\n"%(v,r.get("reason")))\n'
+              'sys.exit({"ALLOW":0,"ASK":42}.get(v,43))\n')
+    with open(os.path.join(shimdir, "client.py"), "w") as f:
+        f.write(client)
+    # /gate-style mediated entry point: verdict first, exec only on ALLOW(0)
+    with open(os.path.join(shimdir, "exec"), "w") as f:
+        f.write('#!/bin/sh\npython3 /g1run/shim/client.py "$@"\nrc=$?\n'
+                'if [ $rc -eq 0 ]; then exec "$@"; fi\nexit $rc\n')
+    os.chmod(os.path.join(shimdir, "exec"), 0o755)
+    return shimdir
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__);
+        return 2
+    if argv[1] == "run":
+        ensure_host_dirs()
+        return cmd_run(argv[2:])
+    if argv[1] == "_inner":
+        return cmd_inner(argv[2:])
+    if argv[1] == "gate":
+        return gate_client(argv[2:])
+    if argv[1] == "verify":
+        return cmd_verify()
+    print(__doc__);
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
