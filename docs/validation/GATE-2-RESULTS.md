@@ -27,5 +27,8 @@
 
 ## Metric rollup (thresholds per GATE-2-USER-TEST-PROTOCOL.md §0)
 
-Not computed — no completed tests. Stop rule: 2 weeks from first post, zero volunteers
-→ INCONCLUSIVE leaning KILL.
+Not computed — no completed tests. Stop rule (REVISED 2026-09-20): founder infra
+runway is 10 days (VPS expiry + unpaid API bill), so the 2-week rule is compressed
+to **7 days from first post, zero volunteers → INCONCLUSIVE leaning KILL**.
+Recorded as a protocol deviation with reason, not hidden. All work is committed +
+pushed to GitHub branches, so nothing is lost if the VPS lapses mid-gate.
